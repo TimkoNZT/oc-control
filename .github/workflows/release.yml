@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(sed -n "s/^const VERSION = '\([^']*\)';.*/\1/p" oc-control.mjs | head -n1)
+          if [ -z "$version" ]; then
+            echo "VERSION not found in oc-control.mjs" >&2
+            exit 1
+          fi
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match v$version" >&2
+            exit 1
+          fi
+
+      - name: Syntax check
+        run: |
+          node --check oc-control.mjs
+          node --check test.mjs
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/oc-control
+          cp oc-control.mjs test.mjs README.md LICENSE dist/oc-control/
+          cd dist
+          zip -r "../oc-control-${GITHUB_REF_NAME}.zip" oc-control
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          asset="oc-control-${tag}.zip"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --verify-tag \
+              --generate-notes \
+              --title "oc-control ${tag}"
+          fi
