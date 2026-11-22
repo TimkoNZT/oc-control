@@ -136,12 +136,15 @@ try {
   const roots = await call('oc_sessions', { limit: 100 });
   check('oc_sessions roots only', Array.isArray(roots) && roots.length > 0 && roots.every((s) => !s.parentID),
     `${roots.length} sessions`);
+  check('oc_sessions context', roots.some((s) => s.context?.limit > 0 && s.context?.used != null),
+    roots.map((s) => s.context?.percent).filter((x) => x != null).slice(0, 3).join(', '));
 
   const { parent, childId, target } = await pickFixtures(roots);
 
   const childInfo = (await call('oc_watch', { sessionId: childId, includeMessages: 0, full: true }))
     .sessions?.[0] ?? {};
   const originalDir = norm(childInfo.directory);
+  const modelRef = childInfo.model ? `${childInfo.model.providerID}/${childInfo.model.id}` : null;
   const originalTitle = childInfo.title ?? null;
   const childBrief = await call('oc_session_edit', { sessionId: childId });
   const childProjectID = childBrief.before?.projectID ?? null;
@@ -161,6 +164,8 @@ try {
   const single = await call('oc_watch', { sessionId: childId, includeMessages: 2 });
   check('oc_watch single session', single.sessions?.[0]?.id === childId,
     `outcome=${single.sessions?.[0]?.outcome} busy=${single.sessions?.[0]?.busy}`);
+  check('oc_watch context', single.sessions?.[0]?.context?.limit > 0 && single.sessions?.[0]?.context?.used != null,
+    `limit=${single.sessions?.[0]?.context?.limit} percent=${single.sessions?.[0]?.context?.percent}`);
 
   if (target) {
     const progress = await call('oc_report', { text: 'e2e progress', kind: 'progress', to: target }, childId);
@@ -275,11 +280,15 @@ try {
       createdSession = await call('oc_create_session', {
         directory: originalDir,
         title: `E2E create ${new Date().toISOString().slice(11, 19)}`,
+        ...(modelRef ? { model: modelRef } : {}),
       });
+      const modelOk =
+        !modelRef ||
+        (createdSession.model?.providerID === childInfo.model.providerID && createdSession.model?.id === childInfo.model.id);
       check(
         'oc_create_session',
-        Boolean(createdSession.id) && sameDir(createdSession.directory, originalDir),
-        `${createdSession.id?.slice(0, 12)} ${createdSession.title ?? ''}`,
+        Boolean(createdSession.id) && sameDir(createdSession.directory, originalDir) && modelOk,
+        `${createdSession.id?.slice(0, 12)} ${modelRef ?? 'default model'}`,
       );
     } catch (e) {
       check('oc_create_session', false, e.message);

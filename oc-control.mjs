@@ -7,7 +7,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 
-const VERSION = '2.5.0';
+const VERSION = '2.5.1';
 const META_KEY = 'ai.opencode/sessionID';
 const DB_PATH =
   process.env.OC_DB ?? path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
@@ -179,6 +179,7 @@ function sessionBrief(s) {
     id: s.id,
     title: s.title,
     agent: s.agent,
+    model: s.model ?? null,
     parentID: s.parentID ?? null,
     outcome: s.outcome ?? s.idleOutcome ?? null,
     busy: isBusy(s),
@@ -220,7 +221,101 @@ async function lastMessages(sessionId, limit = 3, order = 'desc') {
     type: m.type,
     at: m.time?.created ? new Date(m.time.created).toISOString() : null,
     text: messageText(m).replace(/\s+/g, ' ').trim().slice(0, 400),
+    model: m.model ?? null,
+    tokens: m.tokens ?? null,
   }));
+}
+
+function parseModelRef(model) {
+  if (typeof model === 'string') {
+    const m = /^([^/:]+)\/([^:]+)(?::(.+))?$/.exec(model.trim());
+    if (!m) throw new Error('model: ожидается "providerID/modelID" или объект {providerID, id, variant?}');
+    return { providerID: m[1], id: m[2], ...(m[3] ? { variant: m[3] } : {}) };
+  }
+  if (model && typeof model === 'object') {
+    if (!model.providerID || !model.id) throw new Error('model: укажите providerID и id');
+    return {
+      providerID: String(model.providerID),
+      id: String(model.id),
+      ...(model.variant ? { variant: String(model.variant) } : {}),
+    };
+  }
+  throw new Error('model: ожидается "providerID/modelID" или объект {providerID, id, variant?}');
+}
+
+let modelIndexCache = { at: 0, map: new Map() };
+
+async function getModelIndex() {
+  if (modelIndexCache.map.size && Date.now() - modelIndexCache.at < 60_000) return modelIndexCache.map;
+  try {
+    const r = await api('/api/model');
+    const list = Array.isArray(r?.data) ? r.data : Array.isArray(r) ? r : [];
+    const map = new Map();
+    for (const m of list) map.set(`${m.providerID}|${m.modelID ?? m.id}`, m);
+    modelIndexCache = { at: Date.now(), map };
+    return map;
+  } catch {
+    return modelIndexCache.map;
+  }
+}
+
+function contextFor(session, models, last, stale = false) {
+  const ref = last?.model ?? session?.model ?? null;
+  const model = ref ? models.get(`${ref.providerID}|${ref.id}`) : null;
+  const limit = model?.limit?.context ?? null;
+  const outputLimit = model?.limit?.output ?? null;
+  let used = null;
+  let stepAt = null;
+  if (last?.tokens) {
+    const t = last.tokens;
+    used =
+      (t.input ?? 0) +
+      (t.cache?.read ?? 0) +
+      (t.cache?.write ?? 0) +
+      (t.output ?? 0) +
+      (t.reasoning ?? 0);
+    stepAt = last.at ?? null;
+  }
+  return {
+    model: ref,
+    name: model?.name ?? null,
+    limit,
+    outputLimit,
+    used,
+    remaining: limit != null && used != null ? Math.max(0, limit - used) : null,
+    percent: limit && used != null ? Math.round((used / limit) * 1000) / 10 : null,
+    stepAt,
+    stale: Boolean(stale),
+  };
+}
+
+function contextFromRecent(session, models, recent) {
+  const latestAssistant = recent.find((m) => m.type === 'assistant');
+  const last = recent.find((m) => m.type === 'assistant' && m.tokens) ?? null;
+  return contextFor(session, models, last, Boolean(latestAssistant && !latestAssistant.tokens));
+}
+
+async function contextFromMessages(session, models) {
+  try {
+    const recent = await lastMessages(session.id, 5);
+    return contextFromRecent(session, models, recent);
+  } catch {
+    return contextFor(session, models, null, true);
+  }
+}
+
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      out[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 async function allSessions(pageSize = 500) {
@@ -249,8 +344,9 @@ async function childSessions(parentId) {
   return list.filter((s) => s.parentID === parentId);
 }
 
-async function snapshot(sessionIds, includeMessages = 3, full = false) {
+async function snapshot(sessionIds, includeMessages = 3, full = false, withContext = true) {
   const out = [];
+  const models = withContext ? await getModelIndex() : null;
   for (const id of sessionIds) {
     try {
       const s = await getSession(id);
@@ -260,7 +356,10 @@ async function snapshot(sessionIds, includeMessages = 3, full = false) {
         item.cost = s.cost;
         item.tokens = s.tokens;
       }
-      if (includeMessages > 0) item.last = await lastMessages(id, includeMessages);
+      const needMessages = withContext ? Math.max(includeMessages, 5) : includeMessages;
+      const recent = needMessages > 0 ? await lastMessages(id, needMessages) : [];
+      if (withContext) item.context = contextFromRecent(item, models, recent);
+      if (includeMessages > 0) item.last = recent.slice(0, includeMessages);
       out.push(item);
     } catch (e) {
       out.push({ id, error: e.message });
@@ -363,7 +462,7 @@ const tools = {
 
   oc_sessions: {
     description:
-      'Список сессий. Аргументы: limit?(30), rootsOnly?(true — без субагентов), includeChildren?(false — добавить дочерние). Возвращает id, title, agent, parentID, busy, outcome, elapsedSec, tokens.',
+      'Список сессий. Аргументы: limit?(30), rootsOnly?(true — без субагентов), includeChildren?(false — добавить дочерние). Возвращает id, title, agent, model, parentID, busy, outcome, elapsedSec, tokens, context (limit, used, remaining, percent).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -378,12 +477,21 @@ const tools = {
       let list = await allSessions();
       if (rootsOnly) list = list.filter((s) => !s.parentID);
       list = list.sort((a, b) => (b.time?.updated ?? b.time?.created ?? 0) - (a.time?.updated ?? a.time?.created ?? 0));
+      const models = await getModelIndex();
       const picked = list.slice(0, limit).map(sessionBrief);
+      await mapLimit(picked, 5, async (item) => {
+        item.context = await contextFromMessages(item, models);
+      });
       if (includeChildren) {
         for (const s of picked) {
           if (s.busy) {
             const kids = await childSessions(s.id);
-            if (kids.length) s.children = kids.map(sessionBrief);
+            if (kids.length) {
+              s.children = kids.map(sessionBrief);
+              await mapLimit(s.children, 5, async (child) => {
+                child.context = await contextFromMessages(child, models);
+              });
+            }
           }
         }
       }
@@ -393,7 +501,7 @@ const tools = {
 
   oc_create_session: {
     description:
-      'Создать сессию. Аргументы: directory? (абсолютный путь; по умолчанию — каталог вызывающей сессии), title?, parentID? (создать субагента в каталоге родителя), agent?.',
+      'Создать сессию. Аргументы: directory? (абсолютный путь; по умолчанию — каталог вызывающей сессии), title?, parentID? (создать субагента в каталоге родителя), agent? (id агента), model? (строка "providerID/modelID", например "opencode-go/deepseek-v4.1-flash", или {providerID, id, variant?}). Если model не указан, OpenCode берёт модель агента или модель по умолчанию.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -401,10 +509,11 @@ const tools = {
         title: { type: 'string' },
         parentID: { type: 'string' },
         agent: { type: 'string' },
+        model: { description: 'providerID/modelID или {providerID, id, variant?}' },
       },
       additionalProperties: false,
     },
-    async run({ directory, title, parentID, agent }, ctx) {
+    async run({ directory, title, parentID, agent, model }, ctx) {
       if (parentID && directory) throw new Error('укажите либо directory, либо parentID');
       let dir = directory ? normalizeDir(directory) : null;
       if (!dir && !parentID) {
@@ -421,6 +530,15 @@ const tools = {
       }
       if (parentID) body.parentID = parentID;
       if (agent) body.agent = agent;
+      if (model) {
+        const ref = parseModelRef(model);
+        const models = await getModelIndex();
+        const key = `${ref.providerID}|${ref.id}`;
+        if (models.size && !models.has(key)) {
+          throw new Error(`модель ${key} не найдена; список доступных моделей — GET /api/model`);
+        }
+        body.model = ref;
+      }
       const r = await api('/api/session', { method: 'POST', body: JSON.stringify(body) });
       const s = r?.data ?? r;
       return { created: true, ...sessionBrief(s) };
@@ -873,7 +991,7 @@ const tools = {
 
   oc_children: {
     description:
-      'Дочерние сессии (субагенты): список со статусом, временем и последними сообщениями. Аргументы: sessionId? (по умолчанию — вызывающая сессия), includeMessages?(3), activeOnly?(false).',
+      'Дочерние сессии (субагенты): список со статусом, временем, последними сообщениями и заполнением контекста. Аргументы: sessionId? (по умолчанию — вызывающая сессия), includeMessages?(3), activeOnly?(false).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -901,7 +1019,7 @@ const tools = {
 
   oc_watch: {
     description:
-      'Наблюдение за субагентом: снимок или ожидание завершения. Аргументы: sessionId? (по умолчанию — все дети вызывающей сессии), waitSec?(0 — только снимок), pollSec?(5), includeMessages?(3), full?(false — больше полей).',
+      'Наблюдение за субагентом: снимок или ожидание завершения. Аргументы: sessionId? (по умолчанию — все дети вызывающей сессии), waitSec?(0 — только снимок), pollSec?(5), includeMessages?(3), full?(false — больше полей). В сессиях возвращает context: model, limit, used, remaining, percent (used — оценка по последнему assistant-сообщению).',
     inputSchema: {
       type: 'object',
       properties: {
