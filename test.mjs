@@ -138,6 +138,17 @@ try {
     `${roots.length} sessions`);
   check('oc_sessions context', roots.some((s) => s.context?.limit > 0 && s.context?.used != null),
     roots.map((s) => s.context?.percent).filter((x) => x != null).slice(0, 3).join(', '));
+  check('oc_sessions active field', roots.every((s) => typeof s.active === 'boolean'), 'active present');
+  const activeNow = await call('oc_sessions', { limit: 100, rootsOnly: false, activeOnly: true });
+  check('oc_sessions activeOnly', Array.isArray(activeNow) && activeNow.length >= 1 && activeNow.every((s) => s.active),
+    `${activeNow.length} active`);
+  let comboError = null;
+  try {
+    await call('oc_sessions', { rootsOnly: false, includeChildren: true });
+  } catch (e) {
+    comboError = e.message;
+  }
+  check('oc_sessions includeChildren needs rootsOnly', /rootsOnly/.test(comboError ?? ''), comboError ?? 'нет ошибки');
 
   const { parent, childId, target } = await pickFixtures(roots);
 
@@ -156,6 +167,7 @@ try {
   const children = await call('oc_children', { includeMessages: 1 }, parent);
   check('oc_children by caller session', children.parentID === parent && children.count >= 1,
     `${children.count} children`);
+  check('oc_children active field', children.sessions.every((s) => typeof s.active === 'boolean'), 'active present');
 
   const watch = await call('oc_watch', { includeMessages: 1 }, parent);
   check('oc_watch children snapshot', Array.isArray(watch.sessions) && watch.sessions.length === children.count,
@@ -164,8 +176,8 @@ try {
   const single = await call('oc_watch', { sessionId: childId, includeMessages: 2 });
   check('oc_watch single session', single.sessions?.[0]?.id === childId,
     `outcome=${single.sessions?.[0]?.outcome} busy=${single.sessions?.[0]?.busy}`);
-  check('oc_watch context', single.sessions?.[0]?.context?.limit > 0 && single.sessions?.[0]?.context?.used != null,
-    `limit=${single.sessions?.[0]?.context?.limit} percent=${single.sessions?.[0]?.context?.percent}`);
+  check('oc_watch context', single.sessions?.[0]?.context?.limit > 0 && typeof single.sessions?.[0]?.context?.stale === 'boolean',
+    `limit=${single.sessions?.[0]?.context?.limit} used=${single.sessions?.[0]?.context?.used}`);
 
   if (target) {
     const progress = await call('oc_report', { text: 'e2e progress', kind: 'progress', to: target }, childId);

@@ -7,7 +7,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 
-const VERSION = '2.5.1';
+const VERSION = '2.5.2';
 const META_KEY = 'ai.opencode/sessionID';
 const DB_PATH =
   process.env.OC_DB ?? path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
@@ -226,6 +226,17 @@ async function lastMessages(sessionId, limit = 3, order = 'desc') {
   }));
 }
 
+async function getActiveSessionIds() {
+  try {
+    const r = await api('/api/session/active');
+    const data = r?.data ?? r;
+    if (!data || typeof data !== 'object') return null;
+    return new Set(Object.keys(data));
+  } catch {
+    return null;
+  }
+}
+
 function parseModelRef(model) {
   if (typeof model === 'string') {
     const m = /^([^/:]+)\/([^:]+)(?::(.+))?$/.exec(model.trim());
@@ -297,7 +308,7 @@ function contextFromRecent(session, models, recent) {
 
 async function contextFromMessages(session, models) {
   try {
-    const recent = await lastMessages(session.id, 5);
+    const recent = await lastMessages(session.id, 10);
     return contextFromRecent(session, models, recent);
   } catch {
     return contextFor(session, models, null, true);
@@ -347,16 +358,18 @@ async function childSessions(parentId) {
 async function snapshot(sessionIds, includeMessages = 3, full = false, withContext = true) {
   const out = [];
   const models = withContext ? await getModelIndex() : null;
+  const activeIds = await getActiveSessionIds();
   for (const id of sessionIds) {
     try {
       const s = await getSession(id);
       const item = sessionBrief(s);
+      item.active = activeIds ? activeIds.has(id) : item.busy;
       if (full) {
         item.time = s.time;
         item.cost = s.cost;
         item.tokens = s.tokens;
       }
-      const needMessages = withContext ? Math.max(includeMessages, 5) : includeMessages;
+      const needMessages = withContext ? Math.max(includeMessages, 10) : includeMessages;
       const recent = needMessages > 0 ? await lastMessages(id, needMessages) : [];
       if (withContext) item.context = contextFromRecent(item, models, recent);
       if (includeMessages > 0) item.last = recent.slice(0, includeMessages);
@@ -462,23 +475,34 @@ const tools = {
 
   oc_sessions: {
     description:
-      'Список сессий. Аргументы: limit?(30), rootsOnly?(true — без субагентов), includeChildren?(false — добавить дочерние). Возвращает id, title, agent, model, parentID, busy, outcome, elapsedSec, tokens, context (limit, used, remaining, percent).',
+      'Список сессий. Аргументы: limit?(30), rootsOnly?(true — без субагентов), includeChildren?(false — добавить дочерние; только при rootsOnly:true), activeOnly?(false — только активные). Возвращает id, title, agent, model, parentID, busy, active, outcome, elapsedSec, tokens, context (limit, used, remaining, percent).',
     inputSchema: {
       type: 'object',
       properties: {
         limit: { type: 'integer', default: 30 },
         rootsOnly: { type: 'boolean', default: true },
         includeChildren: { type: 'boolean', default: false },
+        activeOnly: { type: 'boolean', default: false },
       },
       additionalProperties: false,
     },
-    async run({ limit = 30, rootsOnly = true, includeChildren = false }) {
+    async run({ limit = 30, rootsOnly = true, includeChildren = false, activeOnly = false }) {
+      if (includeChildren && !rootsOnly) {
+        throw new Error('includeChildren доступен только при rootsOnly:true; для плоского списка используйте rootsOnly:false и parentID');
+      }
       limit = Math.min(Math.max(1, limit), 1000);
+      const activeIds = await getActiveSessionIds();
       let list = await allSessions();
       if (rootsOnly) list = list.filter((s) => !s.parentID);
+      if (activeOnly) list = list.filter((s) => (activeIds ? activeIds.has(s.id) : isBusy(s)));
       list = list.sort((a, b) => (b.time?.updated ?? b.time?.created ?? 0) - (a.time?.updated ?? a.time?.created ?? 0));
       const models = await getModelIndex();
-      const picked = list.slice(0, limit).map(sessionBrief);
+      const brief = (s) => {
+        const item = sessionBrief(s);
+        item.active = activeIds ? activeIds.has(s.id) : item.busy;
+        return item;
+      };
+      const picked = list.slice(0, limit).map(brief);
       await mapLimit(picked, 5, async (item) => {
         item.context = await contextFromMessages(item, models);
       });
@@ -487,7 +511,7 @@ const tools = {
           if (s.busy) {
             const kids = await childSessions(s.id);
             if (kids.length) {
-              s.children = kids.map(sessionBrief);
+              s.children = kids.map(brief);
               await mapLimit(s.children, 5, async (child) => {
                 child.context = await contextFromMessages(child, models);
               });
@@ -1006,7 +1030,8 @@ const tools = {
       const parentId = sessionId ?? ctx.sessionID;
       if (!parentId) throw new Error('не удалось определить сессию: передайте sessionId');
       const kids = await childSessions(parentId);
-      const filtered = activeOnly ? kids.filter(isBusy) : kids;
+      const activeIds = activeOnly ? await getActiveSessionIds() : null;
+      const filtered = activeOnly ? kids.filter((s) => (activeIds ? activeIds.has(s.id) : isBusy(s))) : kids;
       const sorted = filtered.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
       return {
         parentID: parentId,
