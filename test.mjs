@@ -168,10 +168,13 @@ try {
   check('oc_children by caller session', children.parentID === parent && children.count >= 1,
     `${children.count} children`);
   check('oc_children active field', children.sessions.every((s) => typeof s.active === 'boolean'), 'active present');
+  check('oc_children limit', children.count <= 30 && children.count === children.sessions.length &&
+    children.truncated === (children.total > children.count),
+    `${children.count}/${children.total} limit=${children.limit} truncated=${children.truncated}`);
 
   const watch = await call('oc_watch', { includeMessages: 1 }, parent);
-  check('oc_watch children snapshot', Array.isArray(watch.sessions) && watch.sessions.length === children.count,
-    `${watch.sessions.length} watched`);
+  check('oc_watch children snapshot', Array.isArray(watch.sessions) && watch.sessions.length === children.total,
+    `${watch.sessions.length} watched, total=${children.total}`);
 
   const single = await call('oc_watch', { sessionId: childId, includeMessages: 2 });
   check('oc_watch single session', single.sessions?.[0]?.id === childId,

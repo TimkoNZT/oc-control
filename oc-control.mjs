@@ -7,7 +7,7 @@ import path from 'node:path';
 import readline from 'node:readline';
 import { DatabaseSync } from 'node:sqlite';
 
-const VERSION = '2.5.2';
+const VERSION = '2.5.3';
 const META_KEY = 'ai.opencode/sessionID';
 const DB_PATH =
   process.env.OC_DB ?? path.join(os.homedir(), '.local', 'share', 'opencode', 'opencode.db');
@@ -1015,17 +1015,19 @@ const tools = {
 
   oc_children: {
     description:
-      'Дочерние сессии (субагенты): список со статусом, временем, последними сообщениями и заполнением контекста. Аргументы: sessionId? (по умолчанию — вызывающая сессия), includeMessages?(3), activeOnly?(false).',
+      'Дочерние сессии (субагенты): список со статусом, временем, последними сообщениями и заполнением контекста. Аргументы: sessionId? (по умолчанию — вызывающая сессия), limit?(30, max 1000), includeMessages?(3), activeOnly?(false). total — после activeOnly, count — после limit, truncated — лимит отрезал часть.',
     inputSchema: {
       type: 'object',
       properties: {
         sessionId: { type: 'string' },
+        limit: { type: 'integer', default: 30 },
         includeMessages: { type: 'integer', default: 3 },
         activeOnly: { type: 'boolean', default: false },
       },
       additionalProperties: false,
     },
-    async run({ sessionId, includeMessages = 3, activeOnly = false }, ctx) {
+    async run({ sessionId, limit = 30, includeMessages = 3, activeOnly = false }, ctx) {
+      limit = Math.min(Math.max(1, limit), 1000);
       includeMessages = Math.min(Math.max(0, includeMessages), 50);
       const parentId = sessionId ?? ctx.sessionID;
       if (!parentId) throw new Error('не удалось определить сессию: передайте sessionId');
@@ -1033,11 +1035,15 @@ const tools = {
       const activeIds = activeOnly ? await getActiveSessionIds() : null;
       const filtered = activeOnly ? kids.filter((s) => (activeIds ? activeIds.has(s.id) : isBusy(s))) : kids;
       const sorted = filtered.sort((a, b) => (b.time?.created ?? 0) - (a.time?.created ?? 0));
+      const total = sorted.length;
+      const picked = sorted.slice(0, limit);
       return {
         parentID: parentId,
-        count: sorted.length,
-        total: kids.length,
-        sessions: await snapshot(sorted.map((s) => s.id), includeMessages),
+        count: picked.length,
+        total,
+        limit,
+        truncated: total > picked.length,
+        sessions: await snapshot(picked.map((s) => s.id), includeMessages),
       };
     },
   },
